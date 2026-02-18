@@ -1,4 +1,50 @@
 # ============================================================
+# app.py — Morgan Stanley | Rates Sales Dashboard
+# Author  : [Name]
+# Version : 1.0.0
+# ============================================================
+
+
+# ============================================================
+# BLOCK 1 — CONFIGURATION
+# ============================================================
+
+# --- Imports ------------------------------------------------
+import logging
+import os
+from datetime import datetime, timedelta
+
+import feedparser
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+import plotly.express as px
+import requests
+import streamlit as st
+
+# --- Page Config --------------------------------------------
+st.set_page_config(
+    page_title="MS | Rates Sales Dashboard",
+    page_icon="📈",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# --- Logger -------------------------------------------------
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# --- Global CSS Injection -----------------------------------
+def _inject_css() -> None:
+    st.markdown("""
+        <style>
+        /* Typography, colors, table styles, metric cards */
+        </style>
+    """, unsafe_allow_html=True)
+
+_inject_css()
+
+# ============================================================
 # YIELD CURVE TAB — Complete Implementation
 # Functions to paste into their respective blocks in app.py
 # ============================================================
@@ -522,3 +568,4 @@ def tab_yield_curve(data: dict, params: dict) -> None:
         st.plotly_chart(fig_history, use_container_width=True, key="ust_history")
     else:
         st.info("Select at least one tenor to display historical yields.")
+
