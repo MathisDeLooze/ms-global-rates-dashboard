@@ -8,127 +8,139 @@ import requests
 import feedparser
 from datetime import datetime, timedelta
 
-# ============================================================
-#                      STREAMLIT CONFIG
-# ============================================================
+# =====================================================================
+#  STREAMLIT CONFIG + CSS
+# =====================================================================
+
 st.set_page_config(
     page_title="Morgan Stanley – Global Rates Dashboard",
     page_icon="📈",
-    layout="wide",
+    layout="wide"
 )
 
-# ============================================================
-#                      CSS INLINE
-# ============================================================
-css = """
+st.markdown("""
 <style>
 body { font-family: 'Open Sans', sans-serif; }
 .header {
-    background-color: #00539b;
-    padding: 20px;
-    border-radius: 8px;
-    color: white;
-    margin-bottom: 20px;
+    background-color:#00539b; padding:22px; border-radius:8px; color:white;
 }
-h1, h2, h3 { font-weight: 600; }
-.stButton>button {
-    background-color: #00539b;
-    color: white;
-    border-radius: 6px;
-}
+h1, h2, h3 { font-weight:600; }
+.stButton>button { background-color:#00539b; color:white; border-radius:8px; }
 </style>
-"""
-st.markdown(css, unsafe_allow_html=True)
+""", unsafe_allow_html=True)
 
-# ============================================================
-#                      HEADER
-# ============================================================
+# =====================================================================
+#  HEADER
+# =====================================================================
+
 st.markdown(f"""
 <div class='header'>
-    <h1>Morgan Stanley – Global Rates & Macro Dashboard</h1>
-    <h3>Interest Rates Sales Platform</h3>
-    <p>{datetime.today().strftime("%A %d %B %Y")}</p>
+    <h1>Global Rates & Macro Dashboard – Morgan Stanley</h1>
+    <p>{datetime.now().strftime('%A %d %B %Y')}</p>
 </div>
 """, unsafe_allow_html=True)
 
-# ============================================================
-#                      SIDEBAR
-# ============================================================
-st.sidebar.title("⚙️ Settings")
-section = st.sidebar.radio(
-    "Navigation",
-    ["🌍 Global Rates Monitor", "📊 Spread Analyzer",
-     "🔥 Inflation & Macro", "📈 Rates Instruments", "📰 Market News"]
-)
 
-# ============================================================
-#               MOCK DATA (fallback)
-# ============================================================
-def mock_yields(country):
+# =====================================================================
+# 1. YFINANCE ROBUST DOWNLOADER
+# =====================================================================
+
+def download_price(ticker: str, period="1y"):
+    """
+    Télécharge des prix avec gestion d'erreur robuste :
+    - 3 tentatives
+    - fallback OHLC synthétique pro si échec complet
+    """
+
+    for attempt in range(3):
+        try:
+            df = yf.download(
+                tickers=ticker,
+                period=period,
+                progress=False,
+                timeout=10
+            )
+
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                return df
+
+        except Exception as e:
+            pass  # on ignore l’erreur volontairement
+
+    # ------------------ FALLBACK OHLC ------------------
+    # On génère un prix synthétique propre (style MS demo)
+    dates = pd.date_range(end=datetime.today(), periods=250)
+    base = np.cumsum(np.random.randn(250)) + 100
+    fallback = pd.DataFrame({
+        "Open": base + np.random.randn(250),
+        "High": base + np.random.rand(250),
+        "Low": base - np.random.rand(250),
+        "Close": base,
+        "Volume": np.random.randint(10_000, 100_000, 250)
+    }, index=dates)
+
+    st.warning(f"⚠️ {ticker}: données indisponibles → fallback utilisé.")
+
+    return fallback
+
+
+# =====================================================================
+# 2. MOCK YIELD CURVES (propre & scalable)
+# =====================================================================
+
+def get_yields(country: str):
     maturities = ["1M","3M","6M","1Y","2Y","5Y","10Y","30Y"]
-    values = np.linspace(0.5, 3.0, len(maturities)) + np.random.randn(len(maturities)) * 0.1
-    return pd.DataFrame({"Maturity": maturities, "Yield": values, "Country": country})
+    base = {
+        "USA": 4.9,
+        "Germany": 2.3,
+        "France": 2.7,
+        "Italy": 4.0,
+        "UK": 4.2,
+        "Spain": 3.3,
+        "Japan": 0.9,
+        "Canada": 3.9
+    }.get(country, 3.0)
 
-# ============================================================
-#               FUNCTIONS: YIELD DATA
-# ============================================================
-def get_yield_data(countries):
-    dfs = []
-    for c in countries:
-        try:
-            df = mock_yields(c)  # replace with real APIs if available
-            dfs.append(df)
-        except:
-            dfs.append(mock_yields(c))
-    return pd.concat(dfs, ignore_index=True)
+    values = base + np.linspace(-0.3, 0.5, len(maturities))
+    values += np.random.randn(len(maturities))*0.05
 
-def compute_yield_changes(df):
-    return df.groupby("Country")["Yield"].agg(["mean", "min", "max"])
+    return pd.DataFrame({
+        "Country": country,
+        "Maturity": maturities,
+        "Yield": values
+    })
 
-# ============================================================
-#               FUNCTIONS: SPREAD DATA
-# ============================================================
-def compute_spread(c1, c2):
-    dates = pd.date_range(end=datetime.today(), periods=200)
-    values = np.random.randn(200).cumsum()
-    return pd.DataFrame({"Spread": values}, index=dates)
 
-# ============================================================
-#               FUNCTIONS: MACRO DATA
-# ============================================================
+# =====================================================================
+# 3. MACRO (mock pro)
+# =====================================================================
+
 def get_macro(indicators):
-    data = {}
+    out = {}
+    dates = pd.date_range(end=datetime.today(), periods=60, freq="M")
     for ind in indicators:
-        dates = pd.date_range(end=datetime.today(), periods=60, freq="M")
-        values = (np.sin(np.linspace(0, 6, 60)) + 2) * 2
-        data[ind] = pd.DataFrame({"Date": dates, "Value": values})
-    return data
+        trend = np.sin(np.linspace(0, 4, 60))*0.5 + 2
+        out[ind] = pd.DataFrame({"Date": dates, "Value": trend})
+    return out
 
-# ============================================================
-#               FUNCTIONS: INSTRUMENT PRICES
-# ============================================================
-def get_price(ticker):
-    try:
-        df = yf.download(ticker, period="1y")
-        if df.empty:
-            return None
-        return df
-    except:
-        return None
 
-# ============================================================
-#               FUNCTIONS: RSS NEWS
-# ============================================================
+# =====================================================================
+# 4. RSS FEEDS PRO
+# =====================================================================
+
 def get_news(keywords):
-    feeds = ["https://www.reuters.com/rssFeed/financialNews",
-             "https://www.ft.com/rss"]
-    news = []
-    for f in feeds:
+    feeds = [
+        "https://www.ft.com/rss",
+        "https://www.reuters.com/rssFeed/financialNews"
+    ]
+
+    results = []
+    for url in feeds:
         try:
-            rss = feedparser.parse(f)
-            for e in rss.entries[:15]:
+            rss = feedparser.parse(url)
+            for e in rss.entries[:20]:
                 if any(k.lower() in e.title.lower() for k in keywords.split(",")):
-                    news.append({
+                    results.append({
                         "title": e.title,
                         "link": e.link,
                         "date": e.get("published", ""),
@@ -136,11 +148,14 @@ def get_news(keywords):
                     })
         except:
             pass
-    return news
 
-# ============================================================
-#                       PLOTTING
-# ============================================================
+    return results
+
+
+# =====================================================================
+# 5. PLOTS
+# =====================================================================
+
 def plot_yield_curve(df):
     fig = go.Figure()
     for c in df["Country"].unique():
@@ -149,114 +164,127 @@ def plot_yield_curve(df):
             x=sub["Maturity"], y=sub["Yield"],
             mode="lines+markers", name=c
         ))
-    fig.update_layout(title="Yield Curve", template="plotly_white")
+    fig.update_layout(title="Yield Curves", template="plotly_white")
     return fig
 
-def plot_heatmap(df):
-    pivot = df.pivot_table(index="Country", columns="Maturity", values="Yield")
-    return px.imshow(pivot, color_continuous_scale="RdBu_r")
-
-def plot_spread(df):
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=df.index, y=df["Spread"]))
-    fig.update_layout(title="Spread", template="plotly_white")
-    return fig
-
-def plot_macro(df):
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=df["Date"], y=df["Value"]))
-    fig.update_layout(title="Macro Indicator", template="plotly_white")
-    return fig
 
 def plot_candles(df):
-    return go.Figure(data=[go.Candlestick(
-        x=df.index,
-        open=df["Open"], high=df["High"],
-        low=df["Low"], close=df["Close"]
-    )])
+    fig = go.Figure([
+        go.Candlestick(
+            x=df.index,
+            open=df["Open"], high=df["High"],
+            low=df["Low"], close=df["Close"]
+        )
+    ])
+    fig.update_layout(title="Market Prices", template="plotly_white")
+    return fig
 
-# ============================================================
-#                       SECTIONS
-# ============================================================
 
-# ---------------------- 1) GLOBAL RATES ----------------------
-if section == "🌍 Global Rates Monitor":
+# =====================================================================
+#                     DASHBOARD SECTIONS
+# =====================================================================
+
+section = st.sidebar.radio(
+    "Navigation",
+    ["🌍 Rates", "📊 Spreads", "🔥 Macro", "📈 Instruments", "📰 News"]
+)
+
+
+# ---------------------------------------------------------------------
+# 🌍 1) RATES
+# ---------------------------------------------------------------------
+
+if section == "🌍 Rates":
     st.subheader("🌍 Global Rates Monitor")
 
-    countries = ["USA", "Germany", "France", "Italy", "UK", "Spain", "Japan", "Canada"]
-    selected = st.multiselect("Pays :", countries, default=["USA", "Germany"])
+    countries = ["USA","Germany","France","Italy","UK","Spain","Japan","Canada"]
 
-    data = get_yield_data(selected)
+    selected = st.multiselect("Choisir les pays", countries, default=["USA","Germany"])
+    df = pd.concat([get_yields(c) for c in selected])
 
-    col1, col2 = st.columns(2)
-    with col1:
-        st.plotly_chart(plot_yield_curve(data), use_container_width=True)
-    with col2:
-        st.plotly_chart(plot_heatmap(data), use_container_width=True)
-
-    st.write("Variations :")
-    st.dataframe(compute_yield_changes(data))
+    st.plotly_chart(plot_yield_curve(df), use_container_width=True)
+    st.dataframe(df)
 
 
-# ---------------------- 2) SPREAD ANALYZER ----------------------
-if section == "📊 Spread Analyzer":
-    st.subheader("📊 Spread Analyzer")
+# ---------------------------------------------------------------------
+# 📊 2) SPREADS
+# ---------------------------------------------------------------------
 
-    c1 = st.selectbox("Pays A", ["USA", "Germany"])
-    c2 = st.selectbox("Pays B", ["France", "Italy"])
+if section == "📊 Spreads":
+    st.subheader("📊 Spread Analyzer – Intra/Inter Countries")
 
-    spread = compute_spread(c1, c2)
-    st.plotly_chart(plot_spread(spread), use_container_width=True)
+    c1 = st.selectbox("Pays A", ["USA","Germany","France","Italy"])
+    c2 = st.selectbox("Pays B", ["Germany","France","Italy","Spain"])
+
+    y1 = get_yields(c1)
+    y2 = get_yields(c2)
+
+    merged = y1.merge(y2, on="Maturity", suffixes=(f"_{c1}", f"_{c2}"))
+    merged["Spread"] = merged[f"Yield_{c1}"] - merged[f"Yield_{c2}"]
+
+    fig = go.Figure([
+        go.Bar(x=merged["Maturity"], y=merged["Spread"])
+    ])
+    fig.update_layout(title="Yield Spread", template="plotly_white")
+
+    st.plotly_chart(fig, use_container_width=True)
+    st.dataframe(merged)
 
 
-# ---------------------- 3) INFLATION & MACRO ----------------------
-if section == "🔥 Inflation & Macro":
-    st.subheader("🔥 Inflation & Macro Indicators")
+# ---------------------------------------------------------------------
+# 🔥 3) MACRO
+# ---------------------------------------------------------------------
 
-    selected = st.multiselect("Indicateurs", 
-        ["US CPI", "Eurozone HICP", "UK CPI", "Japan CPI"], 
-        default=["US CPI", "Eurozone HICP"])
+if section == "🔥 Macro":
+    st.subheader("🔥 Macro & Inflation Indicators")
 
-    macro = get_macro(selected)
+    indicators = ["US CPI","Eurozone HICP","UK CPI","Japan CPI"]
+    selected = st.multiselect("Choisir", indicators, default=["US CPI"])
 
-    for name, df in macro.items():
-        st.markdown(f"### {name}")
-        st.plotly_chart(plot_macro(df), use_container_width=True)
+    data = get_macro(selected)
+
+    for k, df in data.items():
+        fig = go.Figure([go.Scatter(x=df["Date"], y=df["Value"])])
+        fig.update_layout(title=k, template="plotly_white")
+        st.plotly_chart(fig, use_container_width=True)
 
 
-# ---------------------- 4) RATES INSTRUMENTS ----------------------
-if section == "📈 Rates Instruments":
-    st.subheader("📈 Rates Instruments – Futures, Bonds, Commodities")
+# ---------------------------------------------------------------------
+# 📈 4) INSTRUMENTS
+# ---------------------------------------------------------------------
+
+if section == "📈 Instruments":
+    st.subheader("📈 Fixed Income & Commodities")
 
     tickers = {
-        "UST 10Y": "ZN=F",
-        "Bund Future": "FGBL.DE",
+        "UST 10Y Future (ZN)": "ZN=F",
         "Brent": "BZ=F",
-        "WTI": "CL=F"
+        "WTI": "CL=F",
+        "Bund Future": "FGBL.DE"
     }
 
-    selected = st.multiselect("Instruments :", list(tickers.keys()), default=["UST 10Y"])
+    selected = st.multiselect("Choisir instruments", list(tickers.keys()), default=["UST 10Y Future (ZN)"])
 
-    for inst in selected:
-        df = get_price(tickers[inst])
-        if df is None:
-            st.warning(f"Données indisponibles pour {inst}")
-            continue
-        st.markdown(f"### {inst}")
+    for name in selected:
+        df = download_price(tickers[name])
+        st.markdown(f"### {name}")
         st.plotly_chart(plot_candles(df), use_container_width=True)
 
 
-# ---------------------- 5) NEWS ----------------------
-if section == "📰 Market News":
-    st.subheader("📰 Market News – Rates & Macro")
+# ---------------------------------------------------------------------
+# 📰 5) NEWS
+# ---------------------------------------------------------------------
 
-    keywords = st.text_input("Mots-clés :", "rates, ECB, Fed, inflation")
+if section == "📰 News":
+    st.subheader("📰 Market News – Rates / Central Banks")
+
+    keywords = st.text_input("Mots-clés", "rates, inflation, ECB, Fed")
     news = get_news(keywords)
 
     for n in news:
         st.markdown(f"""
-        ### {n['link']}
-        *{n['date']}*  
+        ### [{n['title']}]({n['link']})
+        **{n['date']}**  
         {n['summary']}  
         ---
         """)
