@@ -1,7 +1,7 @@
 # ============================================================
 # app.py — Morgan Stanley | Rates Sales Dashboard
 # Author  : Mathis de Looze
-# Version : 2.0.0
+# Version : 3.0.0
 # ============================================================
 
 
@@ -10,12 +10,13 @@
 # ============================================================
 
 import logging
+import time
 from datetime import datetime, timedelta
 
-import feedparser
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+import requests
 import streamlit as st
 import yfinance as yf
 
@@ -28,6 +29,7 @@ st.set_page_config(
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
 
 def _inject_css() -> None:
     st.markdown("""
@@ -57,6 +59,7 @@ def _inject_css() -> None:
         </style>
     """, unsafe_allow_html=True)
 
+
 _inject_css()
 
 
@@ -71,7 +74,6 @@ MS_RED   = "#c0392b"
 MS_GREEN = "#27ae60"
 MS_BG    = "#F8F9FA"
 
-# ── Supported countries ──────────────────────────────────────
 COUNTRIES = ["US", "UK", "EU", "DE", "FR", "IT", "JP", "CH"]
 
 COUNTRY_LABELS = {
@@ -85,17 +87,51 @@ COUNTRY_LABELS = {
     "CH": "🇨🇭 Switzerland",
 }
 
-# ── All tenor labels in display order ───────────────────────
-ALL_TENORS = ["1M", "3M", "6M", "1Y", "2Y", "3Y", "5Y", "7Y", "10Y", "20Y", "30Y"]
+# ── Tenors ≥ 1Y only ─────────────────────────────────────────
+ALL_TENORS = ["1Y", "2Y", "3Y", "5Y", "7Y", "10Y", "20Y", "30Y"]
+
+# ── FRED series IDs per (country, tenor) ────────────────────
+# These are the most reliable official sources.
+FRED_SERIES: dict[str, dict[str, str]] = {
+    "US": {
+        "1Y":  "DGS1",
+        "2Y":  "DGS2",
+        "3Y":  "DGS3",
+        "5Y":  "DGS5",
+        "7Y":  "DGS7",
+        "10Y": "DGS10",
+        "20Y": "DGS20",
+        "30Y": "DGS30",
+    },
+    "DE": {
+        "2Y":  "IRLTST01DEM156N",
+        "10Y": "IRLTLT01DEM156N",
+    },
+    "FR": {
+        "10Y": "IRLTLT01FRM156N",
+    },
+    "IT": {
+        "10Y": "IRLTLT01ITM156N",
+    },
+    "JP": {
+        "10Y": "IRLTLT01JPM156N",
+    },
+    "EU": {
+        "10Y": "IRLTLT01EZM156N",
+    },
+    "UK": {
+        "2Y":  "IRLTST01GBM156N",
+        "10Y": "IRLTLT01GBM156N",
+    },
+    "CH": {},
+}
 
 # ── Yahoo Finance tickers per (country, tenor) ───────────────
-# None = not available on Yahoo Finance for that maturity
-YIELD_TICKERS: dict[str, dict[str, str | None]] = {
+# Only tenors ≥ 1Y. None = not available.
+# US note: ^IRX=13W, ^UST2Y=2Y(plain%), ^FVX=5Y(*10), ^TNX=10Y(*10), ^TYX=30Y(*10)
+YAHOO_TICKERS: dict[str, dict[str, str | None]] = {
     "US": {
-        "1M":  "^IRX",
-        "3M":  "^IRX",
-        "6M":  "^IRX",
-        "1Y":  "^IRX",
+        "1Y":  "^IRX",      # best proxy (13-week bill, used as short end)
         "2Y":  "^UST2Y",
         "3Y":  None,
         "5Y":  "^FVX",
@@ -105,7 +141,7 @@ YIELD_TICKERS: dict[str, dict[str, str | None]] = {
         "30Y": "^TYX",
     },
     "UK": {
-        "1M":  None, "3M": None, "6M": None, "1Y": None,
+        "1Y":  None,
         "2Y":  "GBGB2YR=X",
         "3Y":  None,
         "5Y":  "GBGB5YR=X",
@@ -115,7 +151,7 @@ YIELD_TICKERS: dict[str, dict[str, str | None]] = {
         "30Y": "GBGB30YR=X",
     },
     "DE": {
-        "1M":  None, "3M": None, "6M": None, "1Y": None,
+        "1Y":  None,
         "2Y":  "DEDE2YR=X",
         "3Y":  None,
         "5Y":  "DEDE5YR=X",
@@ -125,7 +161,7 @@ YIELD_TICKERS: dict[str, dict[str, str | None]] = {
         "30Y": "DEDE30YR=X",
     },
     "FR": {
-        "1M":  None, "3M": None, "6M": None, "1Y": None,
+        "1Y":  None,
         "2Y":  "FRFR2YR=X",
         "3Y":  None,
         "5Y":  "FRFR5YR=X",
@@ -135,7 +171,7 @@ YIELD_TICKERS: dict[str, dict[str, str | None]] = {
         "30Y": "FRFR30YR=X",
     },
     "IT": {
-        "1M":  None, "3M": None, "6M": None, "1Y": None,
+        "1Y":  None,
         "2Y":  "ITIT2YR=X",
         "3Y":  None,
         "5Y":  "ITIT5YR=X",
@@ -145,8 +181,7 @@ YIELD_TICKERS: dict[str, dict[str, str | None]] = {
         "30Y": "ITIT30YR=X",
     },
     "EU": {
-        # Euro area — use DE Bunds as core Euro benchmark
-        "1M":  None, "3M": None, "6M": None, "1Y": None,
+        "1Y":  None,
         "2Y":  "DEDE2YR=X",
         "3Y":  None,
         "5Y":  "DEDE5YR=X",
@@ -156,7 +191,7 @@ YIELD_TICKERS: dict[str, dict[str, str | None]] = {
         "30Y": "DEDE30YR=X",
     },
     "JP": {
-        "1M":  None, "3M": None, "6M": None, "1Y": None,
+        "1Y":  None,
         "2Y":  "JPJP2YR=X",
         "3Y":  None,
         "5Y":  "JPJP5YR=X",
@@ -166,7 +201,7 @@ YIELD_TICKERS: dict[str, dict[str, str | None]] = {
         "30Y": "JPJP30YR=X",
     },
     "CH": {
-        "1M":  None, "3M": None, "6M": None, "1Y": None,
+        "1Y":  None,
         "2Y":  "CHCH2YR=X",
         "3Y":  None,
         "5Y":  "CHCH5YR=X",
@@ -177,131 +212,211 @@ YIELD_TICKERS: dict[str, dict[str, str | None]] = {
     },
 }
 
-# ── Scale factors ────────────────────────────────────────────
-# Multiply raw Yahoo Close value to obtain plain % (e.g. 4.05 = 4.05%)
-# US legacy tickers (^IRX, ^FVX, ^TNX, ^TYX) are quoted as rate * 10
-# All =X tickers and ^UST2Y are already in plain %
-YIELD_SCALE: dict[str, dict[str, float]] = {
+# ── Yahoo scale factors ───────────────────────────────────────
+# Multiply raw Yahoo Close value → plain percentage (e.g. 4.05 = 4.05 %)
+# ^IRX, ^FVX, ^TNX, ^TYX are quoted as rate * 10  → scale = 0.1
+# ^UST2Y and all =X tickers are already in plain % → scale = 1.0
+YAHOO_SCALE: dict[str, dict[str, float]] = {
     "US": {
-        "1M": 0.1, "3M": 0.1, "6M": 0.1, "1Y": 0.1,
-        "2Y": 1.0,
-        "3Y": 1.0,
-        "5Y": 0.1,
-        "7Y": 1.0,
-        "10Y": 0.1,
+        "1Y":  0.1,   # ^IRX  ÷ 10
+        "2Y":  1.0,   # ^UST2Y already %
+        "3Y":  1.0,
+        "5Y":  0.1,   # ^FVX  ÷ 10
+        "7Y":  1.0,
+        "10Y": 0.1,   # ^TNX  ÷ 10
         "20Y": 1.0,
-        "30Y": 0.1,
+        "30Y": 0.1,   # ^TYX  ÷ 10
     },
     **{
-        country: {tenor: 1.0 for tenor in ALL_TENORS}
-        for country in ["UK", "EU", "DE", "FR", "IT", "JP", "CH"]
+        c: {t: 1.0 for t in ALL_TENORS}
+        for c in ["UK", "EU", "DE", "FR", "IT", "JP", "CH"]
     },
 }
 
-# ── Spread pair per country (short_tenor, long_tenor) ────────
+# ── 2Y/10Y spread pair per country ───────────────────────────
 SPREAD_KEY: dict[str, tuple[str, str]] = {
-    country: ("2Y", "10Y") for country in COUNTRIES
-}
-
-RSS_FEEDS: dict[str, dict[str, str]] = {
-    "Financial Times": {
-        "Markets": "https://www.ft.com/markets?format=rss",
-        "Economy": "https://www.ft.com/global-economy?format=rss",
-    },
-    "CNBC": {
-        "Bonds":   "https://www.cnbc.com/id/20910258/device/rss/rss.html",
-        "Economy": "https://www.cnbc.com/id/15839135/device/rss/rss.html",
-    },
+    c: ("2Y", "10Y") for c in COUNTRIES
 }
 
 
 # ============================================================
-# BLOCK 3 — DATA LAYER
+# BLOCK 3 — DATA LAYER  (multi-source: FRED → Yahoo → warning)
 # ============================================================
+
+# ── FRED helpers ─────────────────────────────────────────────
+
+_FRED_BASE = "https://api.stlouisfed.org/fred/series/observations"
+_FRED_KEY  = "YOUR_FRED_API_KEY"   # set here or via st.secrets["FRED_API_KEY"]
+
+
+def _get_fred_key() -> str:
+    try:
+        return st.secrets["FRED_API_KEY"]
+    except Exception:
+        return _FRED_KEY
+
+
+def _fetch_fred_series(series_id: str, start: str, end: str) -> pd.Series:
+    """
+    Fetch one FRED series. Returns a daily-indexed pd.Series in plain %.
+    FRED already returns values in plain percent (e.g. 4.05 = 4.05 %).
+    Returns empty Series on any failure.
+    """
+    api_key = _get_fred_key()
+    if api_key == "YOUR_FRED_API_KEY":
+        # No key configured — skip silently
+        return pd.Series(dtype=float)
+    try:
+        params = {
+            "series_id":         series_id,
+            "observation_start": start,
+            "observation_end":   end,
+            "api_key":           api_key,
+            "file_type":         "json",
+            "frequency":         "d",
+        }
+        r = requests.get(_FRED_BASE, params=params, timeout=10)
+        r.raise_for_status()
+        obs = r.json().get("observations", [])
+        records = {
+            o["date"]: float(o["value"])
+            for o in obs
+            if o["value"] != "."
+        }
+        if not records:
+            return pd.Series(dtype=float)
+        s = pd.Series(records)
+        s.index = pd.to_datetime(s.index)
+        s.sort_index(inplace=True)
+        return s
+    except Exception as exc:
+        logger.warning(f"FRED fetch failed for {series_id}: {exc}")
+        return pd.Series(dtype=float)
+
+
+# ── Yahoo helper ─────────────────────────────────────────────
+
+def _fetch_yahoo_series(ticker: str, scale: float, start: str, end: str) -> pd.Series:
+    """
+    Fetch one Yahoo Finance ticker. Applies scale so result is in plain %.
+    Returns empty Series on any failure or empty response.
+    """
+    try:
+        raw = yf.download(
+            ticker,
+            start=start,
+            end=end,
+            progress=False,
+            auto_adjust=True,
+        )
+        if raw.empty:
+            return pd.Series(dtype=float)
+
+        if isinstance(raw.columns, pd.MultiIndex):
+            raw.columns = raw.columns.get_level_values(0)
+
+        if "Close" not in raw.columns:
+            return pd.Series(dtype=float)
+
+        s = raw["Close"].squeeze()
+        if isinstance(s, pd.DataFrame):
+            s = s.iloc[:, 0]
+
+        s = s.dropna()
+        if s.empty:
+            return pd.Series(dtype=float)
+
+        s.index = pd.to_datetime(s.index)
+        s = s * scale
+
+        # Sanity-check: a government bond yield should be between -5% and 25%
+        s = s[(s > -5) & (s < 25)]
+        return s
+
+    except Exception as exc:
+        logger.warning(f"Yahoo fetch failed for {ticker}: {exc}")
+        return pd.Series(dtype=float)
+
+
+# ── Master fetch ─────────────────────────────────────────────
 
 @st.cache_data(ttl=900, show_spinner=False)
-def fetch_treasury_yields_yf(
-    country: str,
-    start: str,
-    end: str,
-) -> pd.DataFrame:
+def fetch_yields(country: str, start: str, end: str) -> tuple[pd.DataFrame, list[str]]:
     """
-    Download government bond yields for one country from Yahoo Finance.
+    Fetch government bond yields ≥ 1Y for a given country.
 
-    Deduplicates fetches when multiple tenors share the same ticker
-    (e.g. ^IRX covers US 1M/3M/6M/1Y).  Applies per-(country, tenor)
-    scale so all returned values are in plain % (e.g. 4.05 = 4.05 %).
+    Source priority:
+      1. FRED  — most reliable, daily, official
+      2. Yahoo Finance — fallback
+
+    Parameters
+    ----------
+    country : str
+    start, end : str  — "YYYY-MM-DD"
 
     Returns
     -------
-    pd.DataFrame
-        index   = DatetimeIndex (daily business days)
-        columns = tenor labels available for that country
-        values  = yield in %
-        Fully-NaN rows are dropped.
+    df : pd.DataFrame
+        index   = DatetimeIndex (daily)
+        columns = tenor labels that were successfully fetched
+        values  = yield in plain % (e.g. 4.05 = 4.05 %)
+    missing : list[str]
+        Tenor labels for which NO source returned data.
     """
-    tickers_map = YIELD_TICKERS.get(country, {})
-    scale_map   = YIELD_SCALE.get(country, {})
+    fred_map  = FRED_SERIES.get(country, {})
+    yahoo_map = YAHOO_TICKERS.get(country, {})
+    scale_map = YAHOO_SCALE.get(country, {})
 
-    # Group tenors by ticker to avoid duplicate downloads
-    ticker_to_tenors: dict[str, list[str]] = {}
-    for tenor, ticker in tickers_map.items():
-        if ticker is not None:
-            ticker_to_tenors.setdefault(ticker, []).append(tenor)
+    frames:  dict[str, pd.Series] = {}
+    sources: dict[str, str]       = {}   # tenor → source used
+    missing: list[str]            = []
 
-    frames: dict[str, pd.Series] = {}
+    # Cache Yahoo downloads to avoid re-fetching the same ticker
+    yahoo_cache: dict[str, pd.Series] = {}
 
-    for ticker, tenors in ticker_to_tenors.items():
-        try:
-            raw = yf.download(
-                ticker,
-                start=start,
-                end=end,
-                progress=False,
-                auto_adjust=True,
-            )
-            if raw.empty:
-                logger.warning(f"[{country}] No data returned for {ticker}")
-                continue
+    for tenor in ALL_TENORS:
+        series = pd.Series(dtype=float)
 
-            # Flatten MultiIndex columns produced by newer yfinance versions
-            if isinstance(raw.columns, pd.MultiIndex):
-                raw.columns = raw.columns.get_level_values(0)
+        # ── 1. Try FRED ──────────────────────────────────────
+        fred_id = fred_map.get(tenor)
+        if fred_id:
+            series = _fetch_fred_series(fred_id, start, end)
+            if not series.empty:
+                sources[tenor] = "FRED"
+                logger.info(f"[{country}] {tenor} ← FRED ({fred_id})")
 
-            if "Close" not in raw.columns:
-                logger.warning(f"[{country}] 'Close' missing for {ticker}: {raw.columns.tolist()}")
-                continue
+        # ── 2. Fallback: Yahoo Finance ────────────────────────
+        if series.empty:
+            ticker = yahoo_map.get(tenor)
+            if ticker:
+                if ticker not in yahoo_cache:
+                    scale = scale_map.get(tenor, 1.0)
+                    yahoo_cache[ticker] = _fetch_yahoo_series(ticker, scale, start, end)
+                series = yahoo_cache[ticker].copy()
+                if not series.empty:
+                    sources[tenor] = "Yahoo"
+                    logger.info(f"[{country}] {tenor} ← Yahoo ({ticker})")
 
-            series = raw["Close"].squeeze()
-            if isinstance(series, pd.DataFrame):
-                series = series.iloc[:, 0]
-
-            series.index = pd.to_datetime(series.index)
-
-            for tenor in tenors:
-                scale = scale_map.get(tenor, 1.0)
-                s = series * scale
-                s.name = tenor
-                frames[tenor] = s
-
-        except Exception as exc:
-            logger.error(f"[{country}] Failed fetching {ticker}: {exc}")
-            continue
+        # ── Result ────────────────────────────────────────────
+        if not series.empty:
+            series.name = tenor
+            frames[tenor] = series
+        else:
+            missing.append(tenor)
+            logger.warning(f"[{country}] {tenor}: no data from any source.")
 
     if not frames:
-        logger.warning(f"[{country}] No yield data retrieved.")
-        return pd.DataFrame()
+        return pd.DataFrame(), ALL_TENORS
 
     df = pd.concat(frames.values(), axis=1)
     ordered = [t for t in ALL_TENORS if t in df.columns]
     df = df[ordered]
     df.dropna(how="all", inplace=True)
 
-    return df
+    return df, missing
 
 
 def validate_series(df: pd.DataFrame, context: str = "") -> pd.DataFrame:
-    """Return df unchanged if valid, else log and return empty DataFrame."""
     if df is None or df.empty:
         logger.warning(f"Empty DataFrame [{context}]")
         return pd.DataFrame()
@@ -315,14 +430,7 @@ def validate_series(df: pd.DataFrame, context: str = "") -> pd.DataFrame:
 def build_yield_curve(
     yields_df: pd.DataFrame,
 ) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series]:
-    """
-    Extract cross-sectional yield curves at four reference dates.
-
-    Returns
-    -------
-    (curve_today, curve_1m, curve_1d, curve_1w)
-    Each Series indexed by tenor label, values in plain %.
-    """
+    """Return (today, 1m_ago, 1d_ago, 1w_ago) cross-sectional curves."""
     if yields_df.empty:
         empty = pd.Series(dtype=float)
         return empty, empty, empty, empty
@@ -344,17 +452,15 @@ def build_yield_curve(
 
 def compute_curve_change_table(yields_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Compute Level | Δ1D | Δ1W | Δ1M per tenor.
-
-    Level   → plain %  (e.g. 4.053)
-    Deltas  → basis points  (1 bps = 0.01 percentage point)
+    Level (plain %) | Δ1D | Δ1W | Δ1M (all in basis points).
+    1 bps = 0.01 percentage point.
     """
     if yields_df.empty:
         return pd.DataFrame()
 
     curve_today, curve_1m, curve_1d, curve_1w = build_yield_curve(yields_df)
-
     rows = []
+
     for tenor in curve_today.index:
         level = curve_today.get(tenor, np.nan)
 
@@ -364,15 +470,14 @@ def compute_curve_change_table(yields_df: pd.DataFrame) -> pd.DataFrame:
             ref_val = ref.get(tenor, np.nan)
             if np.isnan(level) or np.isnan(ref_val):
                 return np.nan
-            # Both values are in %; multiply difference by 100 to get bps
-            return (level - ref_val) * 100
+            return round((level - ref_val) * 100, 1)   # % → bps
 
         rows.append({
             "Tenor":     tenor,
             "Level (%)": round(level, 3),
-            "Δ1D (bps)": round(_bps(curve_1d), 1),
-            "Δ1W (bps)": round(_bps(curve_1w), 1),
-            "Δ1M (bps)": round(_bps(curve_1m), 1),
+            "Δ1D (bps)": _bps(curve_1d),
+            "Δ1W (bps)": _bps(curve_1w),
+            "Δ1M (bps)": _bps(curve_1m),
         })
 
     return pd.DataFrame(rows).set_index("Tenor")
@@ -392,16 +497,14 @@ _MS_THEME = {
 
 
 def apply_ms_theme(fig: go.Figure, title: str = "") -> go.Figure:
-    """Apply standardised Morgan Stanley visual theme to any Plotly figure."""
     fig.update_layout(
         font=dict(family=_MS_THEME["font_family"], color=_MS_THEME["font_color"], size=12),
         paper_bgcolor=_MS_THEME["bg_color"],
         plot_bgcolor=_MS_THEME["plot_bg"],
         title=dict(
             text=title,
-            font=dict(color=MS_BLUE, size=15, family="Open Sans, sans-serif"),
-            x=0,
-            xanchor="left",
+            font=dict(color=MS_BLUE, size=15),
+            x=0, xanchor="left",
         ),
         margin=dict(l=40, r=20, t=55, b=40),
         xaxis=dict(gridcolor=_MS_THEME["grid_color"], linecolor="#cccccc"),
@@ -414,11 +517,9 @@ def plot_yield_curve(
     curve_today: pd.Series,
     curve_1m: pd.Series,
     country: str,
-    title: str = "",
     label_today: str = "Today",
     label_1m: str = "1M Ago",
 ) -> go.Figure:
-    """Cross-sectional yield curve: Today (MS Blue) vs 1M Ago (Grey dashed)."""
     fig = go.Figure()
 
     if not curve_1m.empty:
@@ -449,39 +550,36 @@ def plot_yield_curve(
         xaxis=dict(title="Tenor", showgrid=True, gridcolor="#E8E8E8"),
         yaxis=dict(
             title="Yield (%)",
-            showgrid=True,
-            gridcolor="#E8E8E8",
-            tickformat=".2f",
-            ticksuffix="%",
+            showgrid=True, gridcolor="#E8E8E8",
+            tickformat=".2f", ticksuffix="%",
         ),
         height=420,
         hovermode="x unified",
     )
-
-    auto_title = title or f"{COUNTRY_LABELS.get(country, country)} Government Yield Curve"
-    return apply_ms_theme(fig, title=auto_title)
+    return apply_ms_theme(
+        fig,
+        title=f"{COUNTRY_LABELS.get(country, country)} Government Yield Curve",
+    )
 
 
 def plot_yield_history(
     yields_df: pd.DataFrame,
     tenors: list[str],
     country: str,
-    title: str = "",
 ) -> go.Figure:
-    """Time-series of multiple tenor yields over the selected date range."""
-    color_ramp = [MS_DARK, MS_BLUE, "#2980b9", "#5dade2", MS_GREY,
-                  "#e67e22", "#8e44ad", "#16a085", "#c0392b", "#f39c12", "#1abc9c"]
+    color_ramp = [
+        MS_DARK, MS_BLUE, "#2980b9", "#5dade2", MS_GREY,
+        "#e67e22", "#8e44ad", "#16a085", MS_RED, "#f39c12",
+    ]
     fig = go.Figure()
 
     for i, tenor in enumerate(tenors):
         if tenor not in yields_df.columns:
             continue
-        series = yields_df[tenor].dropna()
+        s = yields_df[tenor].dropna()
         fig.add_trace(go.Scatter(
-            x=series.index,
-            y=series.values,
-            mode="lines",
-            name=tenor,
+            x=s.index, y=s.values,
+            mode="lines", name=tenor,
             line=dict(color=color_ramp[i % len(color_ramp)], width=1.8),
             hovertemplate=f"{tenor}: %{{y:.3f}}%<extra></extra>",
         ))
@@ -491,17 +589,16 @@ def plot_yield_history(
         xaxis=dict(showgrid=True, gridcolor="#E8E8E8"),
         yaxis=dict(
             title="Yield (%)",
-            showgrid=True,
-            gridcolor="#E8E8E8",
-            tickformat=".2f",
-            ticksuffix="%",
+            showgrid=True, gridcolor="#E8E8E8",
+            tickformat=".2f", ticksuffix="%",
         ),
         height=380,
         hovermode="x unified",
     )
-
-    auto_title = title or f"{COUNTRY_LABELS.get(country, country)} — Historical Yields"
-    return apply_ms_theme(fig, title=auto_title)
+    return apply_ms_theme(
+        fig,
+        title=f"{COUNTRY_LABELS.get(country, country)} — Historical Yields",
+    )
 
 
 # ============================================================
@@ -509,18 +606,11 @@ def plot_yield_history(
 # ============================================================
 
 def render_header() -> None:
-    """Top banner: desk name, title, live timestamp."""
     st.markdown(f"""
-        <div style="
-            background-color:#ffffff;
-            padding:16px 28px;
-            border-bottom:3px solid {MS_BLUE};
-            border-radius:6px;
-            display:flex;
-            justify-content:space-between;
-            align-items:center;
-            margin-bottom:18px;
-        ">
+        <div style="background:#fff;padding:16px 28px;
+                    border-bottom:3px solid {MS_BLUE};border-radius:6px;
+                    display:flex;justify-content:space-between;
+                    align-items:center;margin-bottom:18px;">
             <div>
                 <p style="margin:0;font-size:11px;color:{MS_GREY};font-weight:600;
                           text-transform:uppercase;letter-spacing:1px;">
@@ -534,38 +624,28 @@ def render_header() -> None:
                 <p style="margin:0;font-size:12px;color:{MS_GREY};">
                     {datetime.now().strftime('%A, %B %d, %Y &nbsp;|&nbsp; %H:%M')} ET
                 </p>
-                <p style="margin:0;font-size:11px;color:{MS_GREY};">Data: Yahoo Finance</p>
+                <p style="margin:0;font-size:11px;color:{MS_GREY};">
+                    Sources: FRED · Yahoo Finance
+                </p>
             </div>
         </div>
     """, unsafe_allow_html=True)
 
 
 def render_sidebar() -> dict:
-    """
-    Render all sidebar widgets.
-
-    Returns
-    -------
-    dict
-        country, start_date, end_date, refresh
-    """
     st.sidebar.markdown(
         f"<p style='font-size:13px;font-weight:700;color:{MS_BLUE};"
         f"text-transform:uppercase;letter-spacing:0.8px;'>Dashboard Settings</p>",
         unsafe_allow_html=True,
     )
 
-    # ── Country ─────────────────────────────────────────────
     st.sidebar.markdown("### 🌍 Country")
     country_display = {COUNTRY_LABELS[c]: c for c in COUNTRIES}
     selected_label  = st.sidebar.selectbox(
-        "Select country",
-        list(country_display.keys()),
-        index=0,
+        "Select country", list(country_display.keys()), index=0
     )
     selected_country = country_display[selected_label]
 
-    # ── Date range ──────────────────────────────────────────
     st.sidebar.markdown("### 📅 Date Range")
     end_default   = datetime.today()
     start_default = end_default - timedelta(days=3 * 365)
@@ -576,13 +656,24 @@ def render_sidebar() -> dict:
     if pd.to_datetime(start_date) >= pd.to_datetime(end_date):
         st.sidebar.error("End date must be after start date.")
 
-    # ── Refresh ─────────────────────────────────────────────
+    st.sidebar.markdown("---")
+
+    # Optional FRED API key input
+    st.sidebar.markdown("### 🔑 FRED API Key *(optional)*")
+    fred_key_input = st.sidebar.text_input(
+        "Enter FRED API key for richer data",
+        value="",
+        type="password",
+        help="Free key at https://fred.stlouisfed.org/docs/api/api_key.html",
+    )
+    if fred_key_input.strip():
+        st.session_state["FRED_API_KEY"] = fred_key_input.strip()
+
     st.sidebar.markdown("---")
     refresh = st.sidebar.button("🔄 Update All Data", use_container_width=True)
     st.sidebar.markdown(
         f"<p style='font-size:11px;color:{MS_GREY};margin-top:8px;'>"
-        f"Cache auto-refreshes every 15 min.<br>"
-        f"Click above to force an update.</p>",
+        f"Cache auto-refreshes every 15 min.</p>",
         unsafe_allow_html=True,
     )
 
@@ -595,43 +686,35 @@ def render_sidebar() -> dict:
 
 
 def render_error_banner(message: str) -> None:
-    """Unified error display across all tabs."""
     st.error(f"⚠️ {message}")
 
 
 def _style_change_table(df: pd.DataFrame):
-    """Colour-coded styling for the yield change table."""
-    def _colour_bps(val):
+    def _colour(val):
         if pd.isna(val):
             return ""
-        if val > 0:
-            return f"color:{MS_RED};font-weight:600;"
-        if val < 0:
-            return f"color:{MS_GREEN};font-weight:600;"
-        return ""
+        return (
+            f"color:{MS_RED};font-weight:600;" if val > 0
+            else f"color:{MS_GREEN};font-weight:600;" if val < 0
+            else ""
+        )
 
     return (
         df.style
         .format({
             "Level (%)":  "{:.3f}%",
-            "Δ1D (bps)":  "{:+.1f}",
-            "Δ1W (bps)":  "{:+.1f}",
-            "Δ1M (bps)":  "{:+.1f}",
+            "Δ1D (bps)":  lambda v: f"{v:+.1f}" if not pd.isna(v) else "—",
+            "Δ1W (bps)":  lambda v: f"{v:+.1f}" if not pd.isna(v) else "—",
+            "Δ1M (bps)":  lambda v: f"{v:+.1f}" if not pd.isna(v) else "—",
         })
-        .map(_colour_bps, subset=["Δ1D (bps)", "Δ1W (bps)", "Δ1M (bps)"])
+        .map(_colour, subset=["Δ1D (bps)", "Δ1W (bps)", "Δ1M (bps)"])
         .set_properties(**{"text-align": "center"})
         .set_table_styles([
             {"selector": "th", "props": [
-                ("background-color", MS_BLUE),
-                ("color", "white"),
-                ("font-weight", "600"),
-                ("font-size", "12px"),
-                ("text-align", "center"),
+                ("background-color", MS_BLUE), ("color", "white"),
+                ("font-weight", "600"), ("font-size", "12px"), ("text-align", "center"),
             ]},
-            {"selector": "td", "props": [
-                ("font-size", "13px"),
-                ("padding", "6px 12px"),
-            ]},
+            {"selector": "td", "props": [("font-size", "13px"), ("padding", "6px 12px")]},
         ])
     )
 
@@ -642,53 +725,76 @@ def _style_change_table(df: pd.DataFrame):
 
 def tab_yield_curve(data: dict, params: dict) -> None:
     """
-    Tab 1 — Yield Curve (multi-country)
-    ─────────────────────────────────────
-    1. KPI strip   — current level per tenor + Δ1D in bps
-    2. Curve chart — Today vs 1M Ago
-    3. Change table — Level | Δ1D | Δ1W | Δ1M
-    4. 2Y/10Y spread card + inversion warning
-    5. Historical time-series (user-selected tenors)
+    Tab 1 — Yield Curve (multi-country, ≥ 1Y, multi-source)
+    ─────────────────────────────────────────────────────────
+    1. Data-source info banner
+    2. Missing-tenor warning (if any)
+    3. KPI strip — level + Δ1D per tenor
+    4. Curve chart (Today vs 1M Ago) + Change table
+    5. 2Y/10Y spread card + inversion warning
+    6. Historical time-series
     """
     country    = params.get("country", "US")
     yields_df  = data.get("yields", pd.DataFrame())
+    missing    = data.get("missing", [])
     flag_label = COUNTRY_LABELS.get(country, country)
 
     # ── Guard ────────────────────────────────────────────────
     if yields_df.empty:
         render_error_banner(
-            f"No yield data available for {flag_label}. "
-            "Several maturities may not be available on Yahoo Finance for this country. "
-            "Try a different country or date range."
+            f"No yield data available for **{flag_label}**. "
+            "Neither FRED nor Yahoo Finance returned valid data for any maturity. "
+            "Check your internet connection or try a different date range."
         )
         return
 
-    # ── Derived data ─────────────────────────────────────────
-    curve_today, curve_1m, curve_1d, curve_1w = build_yield_curve(yields_df)
-    change_table  = compute_curve_change_table(yields_df)
-    last_date     = yields_df.index[-1].strftime("%B %d, %Y")
+    # ── 1. Source info ───────────────────────────────────────
+    available_cols = yields_df.columns.tolist()
+    fred_available  = bool(FRED_SERIES.get(country))
+    fred_key_set    = st.session_state.get("FRED_API_KEY", _FRED_KEY) != "YOUR_FRED_API_KEY"
 
-    # ── Sub-header ───────────────────────────────────────────
+    source_note = "FRED + Yahoo Finance" if (fred_available and fred_key_set) else "Yahoo Finance"
+    last_date   = yields_df.index[-1].strftime("%B %d, %Y")
+
     st.markdown(
         f"<p style='color:{MS_GREY};font-size:13px;margin-bottom:6px;'>"
-        f"<strong>{flag_label}</strong> — "
-        f"Last available trading session: <strong>{last_date}</strong></p>",
+        f"<strong>{flag_label}</strong> &nbsp;·&nbsp; "
+        f"Source: <strong>{source_note}</strong> &nbsp;·&nbsp; "
+        f"Last session: <strong>{last_date}</strong></p>",
         unsafe_allow_html=True,
     )
 
-    # ── 1. KPI strip (max 8 per row) ─────────────────────────
+    # ── 2. Missing tenor warning ──────────────────────────────
+    truly_missing = [t for t in missing if t not in ["1M", "3M", "6M"]]
+    if truly_missing:
+        st.warning(
+            f"⚠️ The following maturities could not be retrieved for {flag_label}: "
+            f"**{', '.join(truly_missing)}**. "
+            "They are excluded from all charts and tables.",
+            icon="📭",
+        )
+
+    # ── 3. Derived data ───────────────────────────────────────
+    curve_today, curve_1m, curve_1d, curve_1w = build_yield_curve(yields_df)
+    change_table = compute_curve_change_table(yields_df)
+
+    # ── 4. KPI strip (max 8 per row) ──────────────────────────
     available_tenors = curve_today.index.tolist()
     if available_tenors:
         for row_start in range(0, len(available_tenors), 8):
-            row_tenors = available_tenors[row_start : row_start + 8]
-            kpi_cols   = st.columns(len(row_tenors))
-            for col, tenor in zip(kpi_cols, row_tenors):
+            row_tenors = available_tenors[row_start: row_start + 8]
+            cols = st.columns(len(row_tenors))
+            for col, tenor in zip(cols, row_tenors):
                 level   = curve_today.get(tenor, np.nan)
                 d1d_raw = (
                     change_table.loc[tenor, "Δ1D (bps)"]
                     if tenor in change_table.index else np.nan
                 )
-                delta_str = f"{d1d_raw:+.1f} bps" if not np.isnan(d1d_raw) else None
+                delta_str = (
+                    f"{d1d_raw:+.1f} bps"
+                    if (d1d_raw is not None and not np.isnan(d1d_raw))
+                    else None
+                )
                 with col:
                     st.metric(
                         label=tenor,
@@ -700,7 +806,7 @@ def tab_yield_curve(data: dict, params: dict) -> None:
 
     st.markdown("---")
 
-    # ── 2 & 3. Curve chart + Change table ────────────────────
+    # ── 5. Curve chart + Change table ─────────────────────────
     col_chart, col_table = st.columns([2.2, 1.2])
 
     with col_chart:
@@ -726,7 +832,7 @@ def tab_yield_curve(data: dict, params: dict) -> None:
 
     st.markdown("---")
 
-    # ── 4. 2Y/10Y spread + inversion warning ─────────────────
+    # ── 6. 2Y/10Y spread + inversion warning ──────────────────
     short_t, long_t = SPREAD_KEY.get(country, ("2Y", "10Y"))
     s_short = curve_today.get(short_t, np.nan)
     s_long  = curve_today.get(long_t,  np.nan)
@@ -739,13 +845,10 @@ def tab_yield_curve(data: dict, params: dict) -> None:
         with card_col:
             st.markdown(
                 f"""
-                <div style='
-                    padding:14px 18px;
-                    border-left:5px solid {spread_color};
-                    background:#ffffff;
-                    border-radius:6px;
-                    box-shadow:0 1px 4px rgba(0,0,0,0.08);
-                '>
+                <div style='padding:14px 18px;
+                            border-left:5px solid {spread_color};
+                            background:#fff;border-radius:6px;
+                            box-shadow:0 1px 4px rgba(0,0,0,0.08);'>
                     <span style='font-size:11px;color:{MS_GREY};font-weight:600;
                                  text-transform:uppercase;letter-spacing:0.5px;'>
                         {short_t}/{long_t} Spread
@@ -761,48 +864,45 @@ def tab_yield_curve(data: dict, params: dict) -> None:
             if spread_bps < 0:
                 st.warning(
                     f"**Yield Curve Inverted** ({flag_label}) — "
-                    f"The {short_t}/{long_t} spread stands at **{spread_bps:.1f} bps**. "
-                    "An inverted curve has historically preceded recessions. "
+                    f"The {short_t}/{long_t} spread is **{spread_bps:.1f} bps**. "
+                    "Historically a leading recession indicator. "
                     "Monitor duration and credit positioning closely.",
                     icon="⚠️",
                 )
             else:
                 st.success(
-                    f"Yield curve is **upward sloping** ({flag_label}). "
-                    f"{short_t}/{long_t} spread: **{spread_bps:+.1f} bps**.",
+                    f"Yield curve **upward sloping** ({flag_label}). "
+                    f"{short_t}/{long_t}: **{spread_bps:+.1f} bps**.",
                     icon="✅",
                 )
     else:
         st.info(
-            f"2Y and/or 10Y data not available for {flag_label} on Yahoo Finance. "
+            f"2Y and/or 10Y data not available for {flag_label}. "
             "Spread cannot be computed."
         )
 
     st.markdown("---")
 
-    # ── 5. Historical time-series ─────────────────────────────
+    # ── 7. Historical time-series ──────────────────────────────
     st.markdown(
         f"<p style='font-weight:700;color:{MS_BLUE};font-size:14px;'>"
         f"Historical Yield Time Series</p>",
         unsafe_allow_html=True,
     )
-
     tenor_options   = yields_df.columns.tolist()
     default_hist    = [t for t in ["2Y", "10Y"] if t in tenor_options] or tenor_options[:2]
     selected_tenors = st.multiselect(
-        label="Select tenors to display:",
+        "Select tenors to display:",
         options=tenor_options,
         default=default_hist,
         key="yc_tenor_select",
     )
-
     if selected_tenors:
-        fig_history = plot_yield_history(
-            yields_df=yields_df,
-            tenors=selected_tenors,
-            country=country,
+        st.plotly_chart(
+            plot_yield_history(yields_df, selected_tenors, country),
+            use_container_width=True,
+            key="ust_history",
         )
-        st.plotly_chart(fig_history, use_container_width=True, key="ust_history")
     else:
         st.info("Select at least one tenor to display the historical chart.")
 
@@ -829,17 +929,26 @@ def tab_news(data: dict, params: dict) -> None:
 # ============================================================
 
 def _load_all_data(params: dict) -> dict:
-    """Centralised data loading — one call per session / refresh."""
-    data: dict = {}
-    country    = params["country"]
+    """
+    Centralised data loading.
+    Injects session-state FRED key before fetching.
+    """
+    country = params["country"]
 
+    # Allow sidebar-entered FRED key to propagate to module-level helper
+    global _FRED_KEY
+    if "FRED_API_KEY" in st.session_state:
+        _FRED_KEY = st.session_state["FRED_API_KEY"]
+
+    data: dict = {}
     with st.spinner(f"Loading {COUNTRY_LABELS.get(country, country)} yield data…"):
-        raw = fetch_treasury_yields_yf(
+        df, missing = fetch_yields(
             country=country,
             start=params["start_date"],
             end=params["end_date"],
         )
-        data["yields"] = validate_series(raw, context=f"{country} yields")
+        data["yields"]  = validate_series(df, context=f"{country} yields")
+        data["missing"] = missing
 
     return data
 
